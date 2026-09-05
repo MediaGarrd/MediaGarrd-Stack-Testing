@@ -1,0 +1,86 @@
+# Fully isolated MediaGarrd smoke-test environment.
+#
+# - Builds the *real* MediaGarrd-Server and MediaGarrd-Client images straight
+#   from the ../MediaGarrd source tree (the actual repo is never modified).
+# - Backs the server's "services" with small fake config/db files under
+#   ./fake-services/ instead of real Jellyfin/Radarr/etc. data.
+# - Everything (network, volumes, image tags, container names, host ports)
+#   is namespaced with "mediagarrd-test" so it can never collide with a real
+#   deployment on the same Docker host.
+#
+# Driven by ./run-test.sh — do not `docker compose up` this manually unless
+# you also intend to tear it down yourself (`docker compose -f
+# docker-compose.test.yml down -v --remove-orphans`).
+
+name: mediagarrd-test
+
+services:
+  mediagarrd-server-test:
+    build:
+      context: ../MediaGarrd
+      dockerfile: MediaGarrd-Server/Dockerfile
+    image: mediagarrd-server:test
+    container_name: mediagarrd-server-test
+    environment:
+      - SERVER_PORT=8080
+      - MEDIAGARRD_BACKUP_INTERVAL=PT1H # scheduler disabled for the test window; runs are triggered manually
+      - MEDIAGARRD_BACKUP_ROOT=/data/server/backups
+      - MEDIAGARRD_RETENTION_COUNT=10
+      - JELLYFIN_ENABLED=true
+      - RADARR_ENABLED=true
+      - SONARR_ENABLED=true
+      - PROWLARR_ENABLED=true
+      - TDARR_ENABLED=true
+      - QBITTORRENT_ENABLED=true
+    volumes:
+      - "./fake-services/jellyfin/config:/srv/sources/jellyfin/config:ro"
+      - "./fake-services/radarr:/srv/sources/radarr:ro"
+      - "./fake-services/sonarr:/srv/sources/sonarr:ro"
+      - "./fake-services/prowlarr:/srv/sources/prowlarr:ro"
+      - "./fake-services/tdarr:/srv/sources/tdarr:ro"
+      - "./fake-services/qbittorrent:/srv/sources/qbittorrent:ro"
+      - "./fake-services/qbittorrent-graveyard:/srv/sources/qbittorrent-graveyard:ro"
+      - "server-backups-test:/data/server/backups"
+    ports:
+      - "18080:8080"
+    networks:
+      - mediagarrd-test-net
+    restart: "no"
+
+  mediagarrd-client-test:
+    build:
+      context: ../MediaGarrd
+      dockerfile: MediaGarrd-Client/Dockerfile
+    image: mediagarrd-client:test
+    container_name: mediagarrd-client-test
+    depends_on:
+      - mediagarrd-server-test
+    environment:
+      - CLIENT_PORT=8081
+      # Long pickup interval so the client's own 60s auto-pickup scheduler
+      # never fires mid-test; the test drives pickup manually via the API.
+      - CLIENT_PICKUP_INTERVAL=PT1H
+      - CLIENT_DOWNLOAD_DIRECTORY=/var/lib/mediagarrd/downloads
+      - CLIENT_STATE_FILE=/var/lib/mediagarrd/client/state.json
+      - MEDIAGARRD_SERVER_PORT=8080
+      - MEDIAGARRD_SERVER_IP=mediagarrd-server-test
+    volumes:
+      - "client-downloads-test:/var/lib/mediagarrd/downloads"
+      - "client-state-test:/var/lib/mediagarrd/client"
+    ports:
+      - "18081:8081"
+    networks:
+      - mediagarrd-test-net
+    restart: "no"
+
+networks:
+  mediagarrd-test-net:
+    name: mediagarrd-test-net
+
+volumes:
+  server-backups-test:
+    name: mediagarrd-test-server-backups
+  client-downloads-test:
+    name: mediagarrd-test-client-downloads
+  client-state-test:
+    name: mediagarrd-test-client-state
