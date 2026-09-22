@@ -172,9 +172,10 @@ if ! sudo docker cp "mediagarrd-client-test:${saved_path}" "${WORKDIR}/downloade
 fi
 
 zip_listing="$(unzip -l "${WORKDIR}/downloaded-backup.zip" 2>/dev/null)" || fail_with_logs "downloaded file at ${saved_path} is not a valid zip archive"
+echo "$zip_listing" > last_run.txt
 
 missing_entries=()
-for expected in "jellyfin/config/" "radarr/appdata/" "sonarr/appdata/" "prowlarr/appdata/" "tdarr/appdata/" "qbittorrent/appdata/" "qbittorrent/graveyard/" "qbittorrent/docker-compose.yml"; do
+for expected in "jellyfin/config/" "radarr/" "sonarr/" "prowlarr/" "tdarr/" "qbittorrent/appdata/" "qbittorrent/saved-torrents/" "qbittorrent/docker-compose.yml"; do
     if ! grep -q -- "$expected" <<<"$zip_listing"; then
         missing_entries+=("$expected")
     fi

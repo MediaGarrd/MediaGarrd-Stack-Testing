@@ -17,8 +17,8 @@ name: mediagarrd-test
 services:
   mediagarrd-server-test:
     build:
-      context: ../MediaGarrd
-      dockerfile: MediaGarrd-Server/Dockerfile
+      context: ../Server
+      dockerfile: ../Server/Dockerfile
     image: mediagarrd-server:test
     container_name: mediagarrd-server-test
     environment:
@@ -32,6 +32,7 @@ services:
       - PROWLARR_ENABLED=true
       - TDARR_ENABLED=true
       - QBITTORRENT_ENABLED=true
+      - QBITTORRENT_SAVED_TORRENTS_PATH=/srv/sources/saved-torrents
     volumes:
       - "./fake-services/jellyfin/config:/srv/sources/jellyfin/config:ro"
       - "./fake-services/radarr:/srv/sources/radarr:ro"
@@ -39,7 +40,7 @@ services:
       - "./fake-services/prowlarr:/srv/sources/prowlarr:ro"
       - "./fake-services/tdarr:/srv/sources/tdarr:ro"
       - "./fake-services/qbittorrent:/srv/sources/qbittorrent:ro"
-      - "./fake-services/qbittorrent-graveyard:/srv/sources/qbittorrent-graveyard:ro"
+      - "./fake-services/qbittorrent-saved-torrents:/srv/sources/saved-torrents:ro"
       - "server-backups-test:/data/server/backups"
     ports:
       - "18080:8080"
@@ -49,8 +50,8 @@ services:
 
   mediagarrd-client-test:
     build:
-      context: ../MediaGarrd
-      dockerfile: MediaGarrd-Client/Dockerfile
+      context: ../Client
+      dockerfile: ../Client/Dockerfile
     image: mediagarrd-client:test
     container_name: mediagarrd-client-test
     depends_on:

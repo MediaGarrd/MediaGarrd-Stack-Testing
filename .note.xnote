@@ -1,0 +1,1 @@
+Build mock directories to be copied into a VM. Add a script to set everything up. Add another script to pull the latest specified branch and start it (both server and client)
