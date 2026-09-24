@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+
+# TODO: Change this from using local paths to shallow copying the repos and
+# running the tests on the cloned copies
+
 # Fully automated, self-contained smoke test for the MediaGarrd server/client
 # workflow. Builds the real server + client images from ../MediaGarrd (never
 # modifying that repo), runs an end-to-end backup -> list -> pickup cycle
@@ -175,7 +179,7 @@ zip_listing="$(unzip -l "${WORKDIR}/downloaded-backup.zip" 2>/dev/null)" || fail
 echo "$zip_listing" > last_run.txt
 
 missing_entries=()
-for expected in "jellyfin/config/" "radarr/" "sonarr/" "prowlarr/" "tdarr/" "qbittorrent/appdata/" "qbittorrent/saved-torrents/" "qbittorrent/docker-compose.yml"; do
+for expected in "jellyfin/config/" "radarr/" "sonarr/" "prowlarr/" "tdarr/" "qbittorrent/config/" "qbittorrent/saved-torrents/" "qbittorrent/docker-compose.yml"; do
     if ! grep -q -- "$expected" <<<"$zip_listing"; then
         missing_entries+=("$expected")
     fi

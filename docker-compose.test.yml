@@ -1,5 +1,7 @@
 # Fully isolated MediaGarrd smoke-test environment.
 #
+# TODO: This will change to use the actual cloned repos instead of local copies
+#
 # - Builds the *real* MediaGarrd-Server and MediaGarrd-Client images straight
 #   from the ../MediaGarrd source tree (the actual repo is never modified).
 # - Backs the server's "services" with small fake config/db files under
