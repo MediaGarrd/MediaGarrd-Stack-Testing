@@ -1,7 +1,5 @@
 # Fully isolated MediaGarrd smoke-test environment.
 #
-# TODO: This will change to use the actual cloned repos instead of local copies
-#
 # - Builds the *real* MediaGarrd-Server and MediaGarrd-Client images straight
 #   from the ../MediaGarrd source tree (the actual repo is never modified).
 # - Backs the server's "services" with small fake config/db files under
@@ -19,8 +17,8 @@ name: mediagarrd-test
 services:
   mediagarrd-server-test:
     build:
-      context: ../Server
-      dockerfile: ../Server/Dockerfile
+      context: ${MEDIAGARRD_SRC_DIR:-..}/Server
+      dockerfile: Dockerfile
     image: mediagarrd-server:test
     container_name: mediagarrd-server-test
     environment:
@@ -52,8 +50,8 @@ services:
 
   mediagarrd-client-test:
     build:
-      context: ../Client
-      dockerfile: ../Client/Dockerfile
+      context: ${MEDIAGARRD_SRC_DIR:-..}/Client
+      dockerfile: Dockerfile
     image: mediagarrd-client:test
     container_name: mediagarrd-client-test
     depends_on:
