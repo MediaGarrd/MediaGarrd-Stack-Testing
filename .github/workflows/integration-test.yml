@@ -1,0 +1,22 @@
+name: Integration test
+
+on:
+  workflow_dispatch:
+    inputs:
+      server-branch:
+        description: MediaGarrd/Server branch
+        default: main
+      client-branch:
+        description: MediaGarrd/Client branch
+        default: main
+
+jobs:
+  integration-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./
+        with:
+          server-branch: ${{ inputs.server-branch }}
+          client-branch: ${{ inputs.client-branch }}

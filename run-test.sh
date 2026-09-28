@@ -1,110 +1,78 @@
 #!/usr/bin/env bash
+#
+# End-to-end integration test for the MediaGarrd Server + Client.
+#
+# Builds both apps (from GitHub branches or a local checkout), starts them in
+# an isolated Docker Compose stack backed by ./fake-services, drives a full
+# backup -> list -> pickup -> verify cycle through the client API, and prints
+# exactly one verdict:
+#
+#   TEST PASSED
+#   TEST FAILED BECAUSE OF <reason>
+#
+# Everything the run creates (containers, volumes, network, clones) is torn
+# down on exit.
 
 set -euo pipefail
 
-INVOKE_DIR="$PWD"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+readonly SCRIPT_DIR
+readonly INVOKE_DIR="$PWD"
 
-SERVER_BRANCH=""
-CLIENT_BRANCH=""
+
+readonly COMPOSE_FILE="$SCRIPT_DIR/docker-compose.test.yml"
+readonly LAST_RUN_FILE="$SCRIPT_DIR/last_run.txt"
+
+readonly GITHUB_ORG_URL="https://github.com/MediaGarrd"
+readonly APPS=(Server Client)
+
+readonly SERVER_URL="http://localhost:18080"
+readonly CLIENT_URL="http://localhost:18081"
+readonly SERVER_CONTAINER="mediagarrd-server-test"
+readonly CLIENT_CONTAINER="mediagarrd-client-test"
+
+readonly TIMEOUT_HEALTH=60  # seconds for each container to answer HTTP
+readonly TIMEOUT_RESOLVE=15 # seconds for the client to resolve the server
+readonly TIMEOUT_PICKUP=20  # seconds for the pickup task to complete
+
+# Paths that must appear in the downloaded backup archive.
+readonly EXPECTED_ARCHIVE_ENTRIES=(
+    "jellyfin/config/"
+    "radarr/"
+    "sonarr/"
+    "prowlarr/"
+    "tdarr/"
+    "qbittorrent/config/"
+    "qbittorrent/saved-torrents/"
+    "qbittorrent/docker-compose.yml"
+)
+
+
+declare -A APP_BRANCH=([Server]="" [Client]="")
+declare -A APP_DIR=()
 LOCAL_PATH=""
+WORKDIR=""
+SUDO=()
+RESULT=""
+REASON=""
+
+
+log() { echo "[test] $*" >&2; }
 
 usage() {
-    cat >&2 <<EOF
+    cat >&2 <<USAGE
 Usage: $0 [--server-branch <name>] [--client-branch <name>]
        $0 --local <dir-containing-Server-and-Client>
 
 Branches default to main. --local cannot be combined with the branch flags.
-EOF
+USAGE
+    exit "${1:-1}"
+}
+
+die() {
+    echo "Error: $*" >&2
     exit 1
 }
-
-compose down -v --remove-orphans >/dev/null 2>&1 || true
-
-while [ $# -gt 0 ]; do
-    case "$1" in
-        --server-branch)
-            [ $# -ge 2 ] || { echo "Error: --server-branch requires a value" >&2; usage; }
-            SERVER_BRANCH="$2"; shift 2 ;;
-        --client-branch)
-            [ $# -ge 2 ] || { echo "Error: --client-branch requires a value" >&2; usage; }
-            CLIENT_BRANCH="$2"; shift 2 ;;
-        --local)
-            [ $# -ge 2 ] || { echo "Error: --local requires a path" >&2; usage; }
-            LOCAL_PATH="$2"; shift 2 ;;
-        -h|--help) usage ;;
-        *) echo "Unknown argument: $1" >&2; usage ;;
-    esac
-done
-
-if [[ -n "$LOCAL_PATH" ]]; then
-    if [[ -n "$SERVER_BRANCH" || -n "$CLIENT_BRANCH" ]]; then
-        echo "Error: --local cannot be combined with --server-branch/--client-branch" >&2
-        usage
-    fi
-    # Resolve to an absolute path relative to where the user ran the script
-    LOCAL_PATH="$(cd "$INVOKE_DIR" && cd "$LOCAL_PATH" 2>/dev/null && pwd)" \
-        || { echo "Error: --local path does not exist" >&2; exit 1; }
-    for d in Server Client; do
-        [[ -d "$LOCAL_PATH/$d" ]] || { echo "Error: $LOCAL_PATH/$d not found" >&2; exit 1; }
-    done
-    SRC_DIR="$LOCAL_PATH"
-else
-    SERVER_BRANCH="${SERVER_BRANCH:-main}"
-    CLIENT_BRANCH="${CLIENT_BRANCH:-main}"
-    SRC_DIR="$SCRIPT_DIR"
-fi
-export MEDIAGARRD_SRC_DIR="$SRC_DIR"
-
-GITHUB_URL="https://github.com"
-MEDIAGARRD_ORG_URL="$GITHUB_URL/MediaGarrd"
-SERVER_REPO="$MEDIAGARRD_ORG_URL/Server"
-CLIENT_REPO="$MEDIAGARRD_ORG_URL/Client"
-
-COMPOSE_FILE="docker-compose.test.yml"
-SERVER_URL="http://localhost:18080"
-CLIENT_URL="http://localhost:18081"
-WORKDIR="$(mktemp -d)"
-
-STAGE_TIMEOUT_HEALTH=60      # seconds to wait for containers to come up healthy
-STAGE_TIMEOUT_RESOLVE=15     # seconds to wait for client to auto-resolve the server
-STAGE_TIMEOUT_PICKUP=20      # seconds to wait for the pickup task to finish
-
-RESULT=""
-REASON=""
-WORKFLOW_START=""
-
-log() {
-    echo "[test] $*" >&2
-}
-
-compose() {
-    sudo env MEDIAGARRD_SRC_DIR="$MEDIAGARRD_SRC_DIR" docker compose -f "$COMPOSE_FILE" "$@"
-}
-
-cleanup() {
-    local exit_code=$?
-    log "Tearing down test environment..."
-    compose down -v --remove-orphans >/dev/null 2>&1 || true
-    if [[ -z "$LOCAL_PATH" ]]; then
-        clean_repos || true
-    fi
-    rm -rf "$WORKDIR" || true
-
-    if [[ -n "$RESULT" ]]; then
-        exit_code=0
-        [[ "$RESULT" == "FAIL" ]] && exit_code=1
-        echo
-        if [[ "$RESULT" == "PASS" ]]; then
-            echo "TEST PASSED"
-        else
-            echo "TEST FAILED BECAUSE OF ${REASON}"
-        fi
-    fi
-    exit "$exit_code"
-}
-trap cleanup EXIT INT TERM
 
 fail() {
     RESULT="FAIL"
@@ -112,152 +80,257 @@ fail() {
     exit 1
 }
 
+fail_with_logs() {
+    dump_container_logs
+    fail "$1"
+}
+
 pass() {
     RESULT="PASS"
     exit 0
 }
 
-# Polls a URL until it returns 2xx or the timeout elapses.
-wait_for_http() {
-    local url="$1" timeout="$2" label="$3"
-    local waited=0
-    while (( waited < timeout )); do
-        if curl -fsS --max-time 3 -o /dev/null "$url"; then
-            return 0
-        fi
-        sleep 1
-        waited=$((waited + 1))
+on_exit() {
+    local exit_code=$?
+    log "Tearing down test environment..."
+    compose down -v --remove-orphans >/dev/null 2>&1 || true
+    [[ -n "$WORKDIR" ]] && rm -rf "$WORKDIR"
+
+    case "$RESULT" in
+        PASS) echo; echo "TEST PASSED"; exit 0 ;;
+        FAIL) echo; echo "TEST FAILED BECAUSE OF ${REASON}"; exit 1 ;;
+        *)    exit "$exit_code" ;;
+    esac
+}
+
+detect_docker_access() {
+    if ! docker info >/dev/null 2>&1; then
+        SUDO=(sudo)
+    fi
+}
+
+docker_cmd() { "${SUDO[@]}" docker "$@"; }
+
+compose() {
+    "${SUDO[@]}" env \
+        MEDIAGARRD_SERVER_DIR="${APP_DIR[Server]:-}" \
+        MEDIAGARRD_CLIENT_DIR="${APP_DIR[Client]:-}" \
+        docker compose -f "$COMPOSE_FILE" "$@"
+}
+
+dump_container_logs() {
+    local container
+    for container in "$SERVER_CONTAINER" "$CLIENT_CONTAINER"; do
+        log "----- ${container} logs (tail) -----"
+        compose logs --no-color --tail=60 "$container" 2>&1 | sed "s/^/[${container}] /" >&2 || true
     done
-    fail "${label} not reachable at ${url} after ${timeout}s"
 }
 
-dump_logs_on_failure() {
-    log "----- mediagarrd-server-test logs (tail) -----"
-    compose logs --no-color --tail=60 mediagarrd-server-test 2>&1 | sed 's/^/[server] /' >&2
-    log "----- mediagarrd-client-test logs (tail) -----"
-    compose logs --no-color --tail=60 mediagarrd-client-test 2>&1 | sed 's/^/[client] /' >&2
+http_get()  { curl -fsS --max-time "${2:-5}" "$1"; }
+http_post() { curl -fsS --max-time "${2:-5}" -X POST "$1"; }
+
+retry_for() {
+    local timeout="$1" check_fn="$2" elapsed=0
+    until "$check_fn"; do
+        (( elapsed >= timeout )) && return 1
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
 }
 
-# Wrap fail() so we always dump recent container logs to help diagnose CI-less failures.
-fail_with_logs() {
-    dump_logs_on_failure
-    fail "$1"
+parse_args() {
+    while (( $# > 0 )); do
+        case "$1" in
+            --server-branch) [[ $# -ge 2 ]] || die "--server-branch requires a value"; APP_BRANCH[Server]="$2"; shift 2 ;;
+            --client-branch) [[ $# -ge 2 ]] || die "--client-branch requires a value"; APP_BRANCH[Client]="$2"; shift 2 ;;
+            --local)         [[ $# -ge 2 ]] || die "--local requires a path";         LOCAL_PATH="$2";    shift 2 ;;
+            -h|--help)       usage 0 ;;
+            *)               echo "Unknown argument: $1" >&2; usage ;;
+        esac
+    done
+
+    if [[ -n "$LOCAL_PATH" && ( -n "${APP_BRANCH[Server]}" || -n "${APP_BRANCH[Client]}" ) ]]; then
+        die "--local cannot be combined with --server-branch/--client-branch"
+    fi
+    APP_BRANCH[Server]="${APP_BRANCH[Server]:-main}"
+    APP_BRANCH[Client]="${APP_BRANCH[Client]:-main}"
 }
 
-clean_repos() {
-    if [ -d ./Server ]; then
-        rm -rf ./Server
+check_dependencies() {
+    local cmd
+    for cmd in docker curl jq unzip git make; do
+        command -v "$cmd" >/dev/null || die "required command '$cmd' not found on PATH"
+    done
+}
+
+# Clones live in WORKDIR, so teardown removes them.
+clone_app() {
+    local app="$1" branch="${APP_BRANCH[$1]}"
+    APP_DIR[$app]="$WORKDIR/src/$app"
+    log "Cloning ${app}@${branch}..."
+    git clone --quiet --depth 1 --branch "$branch" "$GITHUB_ORG_URL/$app" "${APP_DIR[$app]}" \
+        || fail "could not clone ${app} branch '${branch}'"
+}
+
+stage_sources() {
+    local app local_root=""
+    if [[ -n "$LOCAL_PATH" ]]; then
+        local_root="$(cd "$INVOKE_DIR" && cd "$LOCAL_PATH" 2>/dev/null && pwd)" \
+            || log "WARNING: --local path '${LOCAL_PATH}' does not exist"
     fi
 
-    if [ -d ./Client ]; then
-        rm -rf ./Client
+    for app in "${APPS[@]}"; do
+        if [[ -n "$local_root" && -d "$local_root/$app" ]]; then
+            APP_DIR[$app]="$local_root/$app"
+            log "Using local ${app} from ${APP_DIR[$app]}"
+            continue
+        fi
+        if [[ -n "$LOCAL_PATH" ]]; then
+            log "WARNING: no ${app} under '${LOCAL_PATH}', using a temporary clone of main instead"
+        fi
+        clone_app "$app"
+    done
+}
+
+run_unit_tests() {
+    local app
+    for app in "${APPS[@]}"; do
+        if [[ ! -f "${APP_DIR[$app]}/Makefile" ]]; then
+            log "No Makefile in ${app}, skipping its unit tests"
+            continue
+        fi
+        log "Running ${app} unit tests (make test)..."
+        make -C "${APP_DIR[$app]}" test >&2 || fail "${app} unit tests failed (make test)"
+    done
+}
+
+start_stack() {
+    log "Building and starting isolated test stack..."
+    compose up -d --build || fail_with_logs "docker compose up --build failed (see build output above)"
+
+    log "Waiting for containers to answer HTTP..."
+    server_up() { curl -fsS --max-time 3 -o /dev/null "${SERVER_URL}/api/v1/health"; }
+    client_up() { curl -fsS --max-time 3 -o /dev/null "${CLIENT_URL}/api/client/status"; }
+    retry_for "$TIMEOUT_HEALTH" server_up 2>/dev/null \
+        || fail_with_logs "MediaGarrd-Server not reachable at ${SERVER_URL} after ${TIMEOUT_HEALTH}s"
+    retry_for "$TIMEOUT_HEALTH" client_up 2>/dev/null \
+        || fail_with_logs "MediaGarrd-Client not reachable at ${CLIENT_URL} after ${TIMEOUT_HEALTH}s"
+}
+
+step_server_healthy() {
+    local body
+    body="$(http_get "${SERVER_URL}/api/v1/health")" || fail_with_logs "GET /api/v1/health request failed"
+    [[ "$(jq -r '.healthy // false' <<<"$body")" == "true" ]] \
+        || fail_with_logs "server health payload did not report healthy=true (got: ${body})"
+}
+
+step_client_resolves_server() {
+    local active_server=""
+    resolved() {
+        active_server="$(http_get "${CLIENT_URL}/api/client/status" 2>/dev/null | jq -r '.activeServer // empty' 2>/dev/null)"
+        [[ -n "$active_server" ]]
+    }
+    retry_for "$TIMEOUT_RESOLVE" resolved \
+        || fail_with_logs "client never resolved an active server within ${TIMEOUT_RESOLVE}s"
+    log "Client resolved active server: ${active_server}"
+    [[ "$active_server" == *"$SERVER_CONTAINER"* ]] \
+        || fail_with_logs "client resolved unexpected server '${active_server}' (expected ${SERVER_CONTAINER})"
+}
+
+step_trigger_backup() {
+    local body_file="$WORKDIR/run-response.txt" code
+    code="$(curl -s --max-time 30 -o "$body_file" -w '%{http_code}' -X POST "${CLIENT_URL}/api/client/backups/run")"
+    [[ "$code" == "200" ]] \
+        || fail_with_logs "POST /api/client/backups/run returned HTTP ${code} (body: $(cat "$body_file" 2>/dev/null))"
+}
+
+step_backup_listed() {
+    local body count id size
+    body="$(http_get "${CLIENT_URL}/api/client/backups" 10)" || fail_with_logs "GET /api/client/backups request failed"
+    count="$(jq 'length' <<<"$body" 2>/dev/null || echo 0)"
+    (( count >= 1 )) || fail_with_logs "expected at least 1 backup after triggering a run, got: ${body}"
+
+    id="$(jq -r '.[0].id' <<<"$body")"
+    size="$(jq -r '.[0].sizeBytes' <<<"$body")"
+    log "Latest backup: id=${id}, sizeBytes=${size}"
+    if ! [[ "$size" =~ ^[0-9]+$ ]] || (( size == 0 )); then
+        fail_with_logs "latest backup reported sizeBytes=${size} (expected > 0)"
     fi
 }
 
-stage_server_and_client() {
-    local server_branch="$1"
-    local client_branch="$2"
+step_pickup_latest() {
+    local body task_id status="" progress=""
+    body="$(http_post "${CLIENT_URL}/api/client/pickup" 10)" || fail_with_logs "POST /api/client/pickup request failed"
+    task_id="$(jq -r '.taskId // empty' <<<"$body")"
+    [[ -n "$task_id" ]] || fail_with_logs "POST /api/client/pickup did not return a taskId (body: ${body})"
 
-    clean_repos
-    git clone --branch "$server_branch" --depth 1 "$SERVER_REPO" Server
-    git clone --branch "$client_branch" --depth 1 "$CLIENT_REPO" Client
+    finished() {
+        progress="$(http_get "${CLIENT_URL}/api/client/pickup/progress/${task_id}" 2>/dev/null)" || return 1
+        status="$(jq -r '.status // empty' <<<"$progress")"
+        [[ "$status" == "COMPLETED" || "$status" == "FAILED" ]]
+    }
+    retry_for "$TIMEOUT_PICKUP" finished \
+        || fail_with_logs "pickup task ${task_id} did not finish within ${TIMEOUT_PICKUP}s (last status: ${status:-none})"
+    [[ "$status" == "COMPLETED" ]] \
+        || fail_with_logs "pickup task ${task_id} FAILED: $(jq -r '.error // "unknown error"' <<<"$progress")"
+
+    PICKUP_SAVED_PATH="$(jq -r '.savedPath // empty' <<<"$progress")"
+    [[ -n "$PICKUP_SAVED_PATH" ]] || fail_with_logs "pickup task ${task_id} completed but reported no savedPath"
+    log "Pickup saved inside client container at: ${PICKUP_SAVED_PATH}"
 }
 
-if [[ -n "$LOCAL_PATH" ]]; then
-    log "Using local sources from ${LOCAL_PATH}"
-else
-    stage_server_and_client "$SERVER_BRANCH" "$CLIENT_BRANCH" || fail "could not clone server branch '${SERVER_BRANCH}' / client branch '${CLIENT_BRANCH}'"
-fi
+step_verify_archive() {
+    local archive="$WORKDIR/downloaded-backup.zip" listing entry missing=()
+    docker_cmd cp "${CLIENT_CONTAINER}:${PICKUP_SAVED_PATH}" "$archive" >/dev/null \
+        || fail_with_logs "could not copy ${PICKUP_SAVED_PATH} out of ${CLIENT_CONTAINER}"
+    listing="$(unzip -l "$archive" 2>/dev/null)" \
+        || fail_with_logs "downloaded file at ${PICKUP_SAVED_PATH} is not a valid zip archive"
+    echo "$listing" > "$LAST_RUN_FILE"
 
-log "Building and starting isolated test stack (images tagged :test, network/volumes prefixed mediagarrd-test)..."
-if ! compose up -d --build; then
-    fail_with_logs "docker compose up --build failing (see build output above)"
-fi
+    for entry in "${EXPECTED_ARCHIVE_ENTRIES[@]}"; do
+        grep -q -- "$entry" <<<"$listing" || missing+=("$entry")
+    done
+    (( ${#missing[@]} == 0 )) \
+        || fail_with_logs "archive is missing expected entries: ${missing[*]} (see ${LAST_RUN_FILE})"
+}
 
-log "Waiting for containers to report healthy HTTP endpoints (build time excluded from workflow budget)..."
-wait_for_http "${SERVER_URL}/api/v1/health" "$STAGE_TIMEOUT_HEALTH" "MediaGarrd-Server"
-wait_for_http "${CLIENT_URL}/api/client/status" "$STAGE_TIMEOUT_HEALTH" "MediaGarrd-Client"
+run_workflow() {
+    local start steps=(
+        "step_server_healthy:confirming server health payload"
+        "step_client_resolves_server:waiting for client to resolve the test server"
+        "step_trigger_backup:triggering a backup run through the client"
+        "step_backup_listed:verifying the server lists the new backup"
+        "step_pickup_latest:fetching the latest backup via client pickup"
+        "step_verify_archive:validating the downloaded archive contents"
+    )
+    local i=0 step
+    start=$(date +%s)
+    for step in "${steps[@]}"; do
+        i=$((i + 1))
+        log "Step ${i}/${#steps[@]}: ${step#*:}..."
+        "${step%%:*}"
+    done
+    log "Workflow completed in $(( $(date +%s) - start ))s"
+}
 
-# ---- Workflow budget starts here (~30s target) ----
-WORKFLOW_START=$(date +%s)
 
-log "Step 1/6: confirming server health payload..."
-server_health="$(curl -fsS --max-time 5 "${SERVER_URL}/api/v1/health")" || fail_with_logs "GET /api/v1/health request failed"
-server_healthy="$(echo "$server_health" | jq -r '.healthy // false' 2>/dev/null)"
-[[ "$server_healthy" == "true" ]] || fail_with_logs "server health payload did not report healthy=true (got: ${server_health})"
+main() {
+    parse_args "$@"
+    check_dependencies
+    detect_docker_access
 
-log "Step 2/6: waiting for client to auto-resolve the test server via MEDIAGARRD_SERVER_IP..."
-active_server=""
-waited=0
-while (( waited < STAGE_TIMEOUT_RESOLVE )); do
-    status_json="$(curl -fsS --max-time 5 "${CLIENT_URL}/api/client/status" 2>/dev/null)" || status_json=""
-    active_server="$(echo "$status_json" | jq -r '.activeServer // empty' 2>/dev/null)"
-    [[ -n "$active_server" ]] && break
-    sleep 1
-    waited=$((waited + 1))
-done
-[[ -n "$active_server" ]] || fail_with_logs "client never resolved an active server (checked /api/client/status for ${STAGE_TIMEOUT_RESOLVE}s)"
-log "Client resolved active server: ${active_server}"
-[[ "$active_server" == *"mediagarrd-server-test"* ]] || fail_with_logs "client resolved unexpected active server '${active_server}' (expected it to point at mediagarrd-server-test)"
+    WORKDIR="$(mktemp -d)"
+    trap on_exit EXIT INT TERM
 
-log "Step 3/6: triggering a backup run through the client (POST /api/client/backups/run)..."
-run_http_code="$(curl -s --max-time 30 -o "${WORKDIR}/run-response.txt" -w '%{http_code}' -X POST "${CLIENT_URL}/api/client/backups/run")"
-[[ "$run_http_code" == "200" ]] || fail_with_logs "POST /api/client/backups/run returned HTTP ${run_http_code} (body: $(cat "${WORKDIR}/run-response.txt" 2>/dev/null))"
+    stage_sources
 
-log "Step 4/6: verifying the server produced a listable backup archive..."
-backups_json="$(curl -fsS --max-time 10 "${CLIENT_URL}/api/client/backups")" || fail_with_logs "GET /api/client/backups request failed"
-backup_count="$(echo "$backups_json" | jq 'length' 2>/dev/null)"
-[[ "$backup_count" =~ ^[0-9]+$ ]] && (( backup_count >= 1 )) || fail_with_logs "expected at least 1 backup after triggering a run, got: ${backups_json}"
-backup_id="$(echo "$backups_json" | jq -r '.[0].id')"
-backup_size="$(echo "$backups_json" | jq -r '.[0].sizeBytes')"
-log "Latest backup: id=${backup_id}, sizeBytes=${backup_size}"
-[[ "$backup_size" =~ ^[0-9]+$ ]] && (( backup_size > 0 )) || fail_with_logs "latest backup archive reported sizeBytes=${backup_size} (expected > 0)"
+    # Clear out anything left behind by a previously interrupted run.
+    compose down -v --remove-orphans >/dev/null 2>&1 || true
 
-log "Step 5/6: fetching the latest backup through the client's pickup workflow..."
-pickup_start="$(curl -fsS --max-time 10 -X POST "${CLIENT_URL}/api/client/pickup")" || fail_with_logs "POST /api/client/pickup request failed"
-task_id="$(echo "$pickup_start" | jq -r '.taskId // empty')"
-[[ -n "$task_id" ]] || fail_with_logs "POST /api/client/pickup did not return a taskId (body: ${pickup_start})"
+    run_unit_tests
+    start_stack
+    run_workflow
+    pass
+}
 
-pickup_status=""
-saved_path=""
-waited=0
-while (( waited < STAGE_TIMEOUT_PICKUP )); do
-    progress_json="$(curl -fsS --max-time 5 "${CLIENT_URL}/api/client/pickup/progress/${task_id}" 2>/dev/null)" || progress_json=""
-    pickup_status="$(echo "$progress_json" | jq -r '.status // empty' 2>/dev/null)"
-    if [[ "$pickup_status" == "COMPLETED" ]]; then
-        saved_path="$(echo "$progress_json" | jq -r '.savedPath // empty')"
-        break
-    elif [[ "$pickup_status" == "FAILED" ]]; then
-        pickup_error="$(echo "$progress_json" | jq -r '.error // "unknown error"')"
-        fail_with_logs "pickup task ${task_id} reported status FAILED: ${pickup_error}"
-    fi
-    sleep 1
-    waited=$((waited + 1))
-done
-[[ "$pickup_status" == "COMPLETED" ]] || fail_with_logs "pickup task ${task_id} did not reach COMPLETED within ${STAGE_TIMEOUT_PICKUP}s (last status: ${pickup_status:-none})"
-[[ -n "$saved_path" ]] || fail_with_logs "pickup task ${task_id} completed but reported no savedPath"
-log "Pickup completed, saved inside client container at: ${saved_path}"
-
-log "Step 6/6: validating the downloaded archive contents from inside the client container..."
-if ! sudo docker cp "mediagarrd-client-test:${saved_path}" "${WORKDIR}/downloaded-backup.zip" >/dev/null; then
-    fail_with_logs "failed to docker cp the downloaded archive out of mediagarrd-client-test (path: ${saved_path})"
-fi
-
-zip_listing="$(unzip -l "${WORKDIR}/downloaded-backup.zip" 2>/dev/null)" || fail_with_logs "downloaded file at ${saved_path} is not a valid zip archive"
-echo "$zip_listing" > last_run.txt
-
-missing_entries=()
-for expected in "jellyfin/config/" "radarr/" "sonarr/" "prowlarr/" "tdarr/" "qbittorrent/config/" "qbittorrent/saved-torrents/" "qbittorrent/docker-compose.yml"; do
-    if ! grep -q -- "$expected" <<<"$zip_listing"; then
-        missing_entries+=("$expected")
-    fi
-done
-
-if (( ${#missing_entries[@]} > 0 )); then
-    fail_with_logs "downloaded archive is missing expected entries: ${missing_entries[*]} (full listing: $(echo "$zip_listing" | tr '\n' ' '))"
-fi
-
-WORKFLOW_END=$(date +%s)
-log "Workflow (run -> list -> pickup -> verify) completed in $((WORKFLOW_END - WORKFLOW_START))s"
-
-pass
+main "$@"
