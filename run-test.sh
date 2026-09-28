@@ -1,30 +1,66 @@
 #!/usr/bin/env bash
 
-# TODO: Change this from using local paths to shallow copying the repos and
-# running the tests on the cloned copies
+set -euo pipefail
 
-# Fully automated, self-contained smoke test for the MediaGarrd server/client
-# workflow. Builds the real server + client images from ../MediaGarrd (never
-# modifying that repo), runs an end-to-end backup -> list -> pickup cycle
-# against fake service data, and prints a single definitive verdict:
-#
-#   TEST PASSED
-# or
-#   TEST FAILED BECAUSE OF <reason>
-#
-# The container build (first run only, or after a source change) is not
-# counted against the ~30s budget below — that budget covers the actual
-# workflow exercise once both containers are up and healthy. Re-runs with a
-# warm Docker build cache are fast end-to-end.
-#
-# Usage: ./run-test.sh
-# Everything this script creates (containers, images, volumes, network) is
-# torn down automatically on exit, whether the test passes or fails.
-
-set -uo pipefail
-
+INVOKE_DIR="$PWD"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
+
+SERVER_BRANCH=""
+CLIENT_BRANCH=""
+LOCAL_PATH=""
+
+usage() {
+    cat >&2 <<EOF
+Usage: $0 [--server-branch <name>] [--client-branch <name>]
+       $0 --local <dir-containing-Server-and-Client>
+
+Branches default to main. --local cannot be combined with the branch flags.
+EOF
+    exit 1
+}
+
+compose down -v --remove-orphans >/dev/null 2>&1 || true
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --server-branch)
+            [ $# -ge 2 ] || { echo "Error: --server-branch requires a value" >&2; usage; }
+            SERVER_BRANCH="$2"; shift 2 ;;
+        --client-branch)
+            [ $# -ge 2 ] || { echo "Error: --client-branch requires a value" >&2; usage; }
+            CLIENT_BRANCH="$2"; shift 2 ;;
+        --local)
+            [ $# -ge 2 ] || { echo "Error: --local requires a path" >&2; usage; }
+            LOCAL_PATH="$2"; shift 2 ;;
+        -h|--help) usage ;;
+        *) echo "Unknown argument: $1" >&2; usage ;;
+    esac
+done
+
+if [[ -n "$LOCAL_PATH" ]]; then
+    if [[ -n "$SERVER_BRANCH" || -n "$CLIENT_BRANCH" ]]; then
+        echo "Error: --local cannot be combined with --server-branch/--client-branch" >&2
+        usage
+    fi
+    # Resolve to an absolute path relative to where the user ran the script
+    LOCAL_PATH="$(cd "$INVOKE_DIR" && cd "$LOCAL_PATH" 2>/dev/null && pwd)" \
+        || { echo "Error: --local path does not exist" >&2; exit 1; }
+    for d in Server Client; do
+        [[ -d "$LOCAL_PATH/$d" ]] || { echo "Error: $LOCAL_PATH/$d not found" >&2; exit 1; }
+    done
+    SRC_DIR="$LOCAL_PATH"
+else
+    SERVER_BRANCH="${SERVER_BRANCH:-main}"
+    CLIENT_BRANCH="${CLIENT_BRANCH:-main}"
+    SRC_DIR="$SCRIPT_DIR"
+fi
+export MEDIAGARRD_SRC_DIR="$SRC_DIR"
+
+GITHUB_URL="https://github.com"
+MEDIAGARRD_ORG_URL="$GITHUB_URL/MediaGarrd"
+SERVER_REPO="$MEDIAGARRD_ORG_URL/Server"
+CLIENT_REPO="$MEDIAGARRD_ORG_URL/Client"
 
 COMPOSE_FILE="docker-compose.test.yml"
 SERVER_URL="http://localhost:18080"
@@ -43,11 +79,18 @@ log() {
     echo "[test] $*" >&2
 }
 
+compose() {
+    sudo env MEDIAGARRD_SRC_DIR="$MEDIAGARRD_SRC_DIR" docker compose -f "$COMPOSE_FILE" "$@"
+}
+
 cleanup() {
     local exit_code=$?
     log "Tearing down test environment..."
-    sudo docker compose -f "$COMPOSE_FILE" down -v --remove-orphans >/dev/null 2>&1
-    rm -rf "$WORKDIR"
+    compose down -v --remove-orphans >/dev/null 2>&1 || true
+    if [[ -z "$LOCAL_PATH" ]]; then
+        clean_repos || true
+    fi
+    rm -rf "$WORKDIR" || true
 
     if [[ -n "$RESULT" ]]; then
         exit_code=0
@@ -90,9 +133,9 @@ wait_for_http() {
 
 dump_logs_on_failure() {
     log "----- mediagarrd-server-test logs (tail) -----"
-    sudo docker compose -f "$COMPOSE_FILE" logs --no-color --tail=60 mediagarrd-server-test 2>&1 | sed 's/^/[server] /' >&2
+    compose logs --no-color --tail=60 mediagarrd-server-test 2>&1 | sed 's/^/[server] /' >&2
     log "----- mediagarrd-client-test logs (tail) -----"
-    sudo docker compose -f "$COMPOSE_FILE" logs --no-color --tail=60 mediagarrd-client-test 2>&1 | sed 's/^/[client] /' >&2
+    compose logs --no-color --tail=60 mediagarrd-client-test 2>&1 | sed 's/^/[client] /' >&2
 }
 
 # Wrap fail() so we always dump recent container logs to help diagnose CI-less failures.
@@ -101,8 +144,33 @@ fail_with_logs() {
     fail "$1"
 }
 
+clean_repos() {
+    if [ -d ./Server ]; then
+        rm -rf ./Server
+    fi
+
+    if [ -d ./Client ]; then
+        rm -rf ./Client
+    fi
+}
+
+stage_server_and_client() {
+    local server_branch="$1"
+    local client_branch="$2"
+
+    clean_repos
+    git clone --branch "$server_branch" --depth 1 "$SERVER_REPO" Server
+    git clone --branch "$client_branch" --depth 1 "$CLIENT_REPO" Client
+}
+
+if [[ -n "$LOCAL_PATH" ]]; then
+    log "Using local sources from ${LOCAL_PATH}"
+else
+    stage_server_and_client "$SERVER_BRANCH" "$CLIENT_BRANCH" || fail "could not clone server branch '${SERVER_BRANCH}' / client branch '${CLIENT_BRANCH}'"
+fi
+
 log "Building and starting isolated test stack (images tagged :test, network/volumes prefixed mediagarrd-test)..."
-if ! sudo docker compose -f "$COMPOSE_FILE" up -d --build; then
+if ! compose up -d --build; then
     fail_with_logs "docker compose up --build failing (see build output above)"
 fi
 
@@ -171,7 +239,7 @@ done
 log "Pickup completed, saved inside client container at: ${saved_path}"
 
 log "Step 6/6: validating the downloaded archive contents from inside the client container..."
-if ! sudo docker cp "mediagarrd-client-test:${saved_path}" "${WORKDIR}/downloaded-backup.zip" >/dev/null 2>&1; then
+if ! sudo docker cp "mediagarrd-client-test:${saved_path}" "${WORKDIR}/downloaded-backup.zip" >/dev/null; then
     fail_with_logs "failed to docker cp the downloaded archive out of mediagarrd-client-test (path: ${saved_path})"
 fi
 
