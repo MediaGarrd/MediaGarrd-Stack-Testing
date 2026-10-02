@@ -1,0 +1,40 @@
+name: MediaGarrd stack integration test
+description: >-
+  Builds MediaGarrd Server and Client from the given branches, runs their unit
+  tests, and runs the end-to-end backup -> pickup integration test.
+
+inputs:
+  server-branch:
+    description: Branch of MediaGarrd/Server to test.
+    required: false
+    default: main
+  client-branch:
+    description: Branch of MediaGarrd/Client to test.
+    required: false
+    default: main
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: "21"
+
+    - name: Run integration test
+      shell: bash
+      env:
+        SERVER_BRANCH: ${{ inputs.server-branch }}
+        CLIENT_BRANCH: ${{ inputs.client-branch }}
+      run: |
+        "$GITHUB_ACTION_PATH/run-test.sh" \
+          --server-branch "$SERVER_BRANCH" \
+          --client-branch "$CLIENT_BRANCH"
+
+    - name: Upload archive listing
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: mediagarrd-archive-listing
+        path: ${{ github.action_path }}/last_run.txt
+        if-no-files-found: ignore
