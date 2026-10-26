@@ -220,6 +220,11 @@ stage_sources() {
     done
 }
 
+create_fixture_links() {
+    ln -sfn config.xml "$FAKE_SERVICES_DIR/sonarr/config/current-config.xml" \
+        || fail "could not create the fixture symbolic link"
+}
+
 run_unit_tests() {
     local app
     for app in "${APPS[@]}"; do
@@ -421,6 +426,7 @@ main() {
     compose down -v --remove-orphans >/dev/null 2>&1 || true
     remove_helper_containers
 
+    create_fixture_links
     run_unit_tests
     start_stack
     run_workflow
