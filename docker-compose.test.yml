@@ -2,11 +2,12 @@
 #
 # - Builds the *real* MediaGarrd-Server and MediaGarrd-Client images straight
 #   from the ../MediaGarrd source tree (the actual repo is never modified).
-# - Backs the server's "services" with small fake config/db files under
-#   ./fake-services/ instead of real Jellyfin/Radarr/etc. data.
-# - Everything (network, volumes, image tags, container names, host ports)
-#   is namespaced with "mediagarrd-test" so it can never collide with a real
-#   deployment on the same Docker host.
+# - The server gets the host Docker socket; run-test.sh registers services
+#   pointing at the small fake config/db files under ./fake-services/ (host
+#   paths), which the server copies out through busybox helper containers.
+# - Everything (network, volumes, image tags, container names, host ports,
+#   helper containers) is namespaced with "mediagarrd-test"/"mgtest-" so it
+#   can never collide with a real deployment on the same Docker host.
 #
 # Driven by ./run-test.sh — do not `docker compose up` this manually unless
 # you also intend to tear it down yourself (`docker compose -f
@@ -26,22 +27,11 @@ services:
       - MEDIAGARRD_BACKUP_INTERVAL=PT1H # scheduler disabled for the test window; runs are triggered manually
       - MEDIAGARRD_BACKUP_ROOT=/data/server/backups
       - MEDIAGARRD_RETENTION_COUNT=10
-      - JELLYFIN_ENABLED=true
-      - RADARR_ENABLED=true
-      - SONARR_ENABLED=true
-      - PROWLARR_ENABLED=true
-      - TDARR_ENABLED=true
-      - QBITTORRENT_ENABLED=true
-      - QBITTORRENT_SAVED_TORRENTS_PATH=/srv/sources/saved-torrents
+      - MEDIAGARRD_DATABASE_PATH=/var/lib/mediagarrd/db/mediagarrd.db
     volumes:
-      - "./fake-services/jellyfin/config:/srv/sources/jellyfin/config:ro"
-      - "./fake-services/radarr:/srv/sources/radarr:ro"
-      - "./fake-services/sonarr:/srv/sources/sonarr:ro"
-      - "./fake-services/prowlarr:/srv/sources/prowlarr:ro"
-      - "./fake-services/tdarr:/srv/sources/tdarr:ro"
-      - "./fake-services/qbittorrent:/srv/sources/qbittorrent:ro"
-      - "./fake-services/qbittorrent-saved-torrents:/srv/sources/saved-torrents:ro"
       - "server-backups-test:/data/server/backups"
+      - "server-db-test:/var/lib/mediagarrd/db"
+      - "/var/run/docker.sock:/var/run/docker.sock"
     ports:
       - "18080:8080"
     networks:
@@ -81,6 +71,8 @@ networks:
 volumes:
   server-backups-test:
     name: mediagarrd-test-server-backups
+  server-db-test:
+    name: mediagarrd-test-server-db
   client-downloads-test:
     name: mediagarrd-test-client-downloads
   client-state-test:

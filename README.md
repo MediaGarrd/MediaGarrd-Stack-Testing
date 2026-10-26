@@ -10,8 +10,14 @@ The run:
    and [Client](https://github.com/MediaGarrd/Client) at the requested
    branches, or uses a local checkout.
 2. Runs each app's unit tests (`make test`) if it ships a `Makefile`.
-3. Builds both images and starts them against `./fake-services`.
-4. Drives health -> server resolution -> backup run -> listing -> pickup ->
+3. Builds both images and starts them, giving the server the host Docker
+   socket.
+4. Runs the server's first-time setup: reads the setup PIN from the server
+   logs, unlocks setup, registers the `./fake-services` directories as
+   `mgtest-*` services through `POST /api/v1/services` (host paths, so the
+   Docker daemon must be able to see this directory), finishes setup, and
+   checks that `/config` is disabled afterwards.
+5. Drives health -> server resolution -> backup run -> listing -> pickup ->
    archive validation through the client API.
 
 ## Run it locally
@@ -30,8 +36,9 @@ TEST PASSED
 TEST FAILED BECAUSE OF <reason>
 ```
 
-and always tears down every container, volume, network, and clone it
-created. The archive listing from the last run is written to `last_run.txt`.
+and always tears down every container (including the server's
+`mediagarrd-backup-mgtest-*` helper containers), volume, network, and clone
+it created. The archive listing from the last run is written to `last_run.txt`.
 
 With `--local`, any of `Server/` or `Client/` missing from the given path is
 replaced by a temporary clone of `main` (with a warning), which is removed
@@ -56,9 +63,10 @@ jobs:
 ```
 
 Branches must exist on the `MediaGarrd/Server` / `MediaGarrd/Client`
-remotes (PRs from forks won't resolve). Because this repo is private, other
-repos can only use the action once *Settings -> Actions -> General -> Access*
-allows repositories in the organization.
+remotes (PRs from forks won't resolve). The action is used from `@main`, so
+changes here only take effect for other repos once they are pushed to `main`.
+Allow 30 minutes for the job: it builds both images and runs both unit-test
+suites.
 
 It can also be run manually from this repo's **Actions -> Integration test ->
 Run workflow**, with both branches as inputs.

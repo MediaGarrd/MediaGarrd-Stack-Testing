@@ -3,7 +3,9 @@
 # End-to-end integration test for the MediaGarrd Server + Client.
 #
 # Builds both apps (from GitHub branches or a local checkout), starts them in
-# an isolated Docker Compose stack backed by ./fake-services, drives a full
+# an isolated Docker Compose stack, unlocks server setup with the PIN from
+# the server logs, registers ./fake-services as services through the server
+# API, finishes setup, drives a full
 # backup -> list -> pickup -> verify cycle through the client API, and prints
 # exactly one verdict:
 #
@@ -35,23 +37,41 @@ readonly TIMEOUT_HEALTH=60  # seconds for each container to answer HTTP
 readonly TIMEOUT_RESOLVE=15 # seconds for the client to resolve the server
 readonly TIMEOUT_PICKUP=20  # seconds for the pickup task to complete
 
-# Paths that must appear in the downloaded backup archive.
-readonly EXPECTED_ARCHIVE_ENTRIES=(
-    "jellyfin/config/"
-    "radarr/"
-    "sonarr/"
-    "prowlarr/"
-    "tdarr/"
-    "qbittorrent/config/"
-    "qbittorrent/saved-torrents/"
-    "qbittorrent/docker-compose.yml"
+readonly FAKE_SERVICES_DIR="$SCRIPT_DIR/fake-services"
+readonly FAKE_ROOT="${FAKE_SERVICES_DIR#/}"
+
+# Services registered through the server API. Names are prefixed so the
+# helper containers (mediagarrd-backup-<name>) never clash with a real
+# deployment sharing the Docker daemon. Paths are relative to fake-services/.
+readonly TEST_SERVICE_PREFIX="mgtest-"
+readonly -A TEST_SERVICES=(
+    [mgtest-jellyfin]="jellyfin/config"
+    [mgtest-radarr]="radarr"
+    [mgtest-sonarr]="sonarr"
+    [mgtest-prowlarr]="prowlarr"
+    [mgtest-tdarr]="tdarr"
+    [mgtest-qbittorrent]="qbittorrent qbittorrent-saved-torrents/deleted_torrent.torrent.bak"
 )
 
+# Files that must appear in the downloaded backup archive, laid out by their
+# absolute host path without the leading slash.
+readonly EXPECTED_ARCHIVE_ENTRIES=(
+    "$FAKE_ROOT/jellyfin/config/system.xml"
+    "$FAKE_ROOT/jellyfin/config/plugins/plugin.dat"
+    "$FAKE_ROOT/radarr/config/radarr.db"
+    "$FAKE_ROOT/sonarr/config/sonarr.db"
+    "$FAKE_ROOT/sonarr/config/current-config.xml"
+    "$FAKE_ROOT/prowlarr/config/config.xml"
+    "$FAKE_ROOT/tdarr/server/db.sqlite"
+    "$FAKE_ROOT/qbittorrent/config/qBittorrent.conf"
+    "$FAKE_ROOT/qbittorrent-saved-torrents/deleted_torrent.torrent.bak"
+)
 
 declare -A APP_BRANCH=([Server]="" [Client]="")
 declare -A APP_DIR=()
 LOCAL_PATH=""
 WORKDIR=""
+SETUP_COOKIES=""
 SUDO=()
 RESULT=""
 REASON=""
@@ -94,12 +114,14 @@ on_exit() {
     local exit_code=$?
     log "Tearing down test environment..."
     compose down -v --remove-orphans >/dev/null 2>&1 || true
+    remove_helper_containers
     [[ -n "$WORKDIR" ]] && rm -rf "$WORKDIR"
 
     case "$RESULT" in
         PASS) echo; echo "TEST PASSED"; exit 0 ;;
         FAIL) echo; echo "TEST FAILED BECAUSE OF ${REASON}"; exit 1 ;;
-        *)    exit "$exit_code" ;;
+        *)    (( exit_code == 0 )) || { echo; echo "TEST FAILED BECAUSE OF an unexpected error (exit code ${exit_code})"; }
+              exit "$exit_code" ;;
     esac
 }
 
@@ -116,6 +138,12 @@ compose() {
         MEDIAGARRD_SERVER_DIR="${APP_DIR[Server]:-}" \
         MEDIAGARRD_CLIENT_DIR="${APP_DIR[Client]:-}" \
         docker compose -f "$COMPOSE_FILE" "$@"
+}
+
+remove_helper_containers() {
+    local ids
+    ids="$(docker_cmd ps -aq --filter "name=mediagarrd-backup-${TEST_SERVICE_PREFIX}" 2>/dev/null)" || return 0
+    [[ -n "$ids" ]] && docker_cmd rm -f $ids >/dev/null 2>&1 || true
 }
 
 dump_container_logs() {
@@ -224,6 +252,50 @@ step_server_healthy() {
         || fail_with_logs "server health payload did not report healthy=true (got: ${body})"
 }
 
+expect_status() {
+    local expected="$1" what="$2" code
+    shift 2
+    code="$(curl -s --max-time 10 -o "$WORKDIR/response.txt" -w '%{http_code}' "$@")"
+    [[ "$code" == "$expected" ]] \
+        || fail_with_logs "${what} returned HTTP ${code}, expected ${expected} (body: $(cat "$WORKDIR/response.txt" 2>/dev/null))"
+}
+
+post_json() {
+    local expected="$1" what="$2" body="$3" url="$4"
+    expect_status "$expected" "$what" -b "$SETUP_COOKIES" -c "$SETUP_COOKIES" \
+        -X POST -H 'Content-Type: application/json' -d "$body" "$url"
+}
+
+step_unlock_setup() {
+    local pin
+    expect_status 401 "config API before setup was unlocked" "${SERVER_URL}/api/v1/services"
+    pin="$(docker_cmd logs "$SERVER_CONTAINER" 2>&1 | grep -oE 'Setup PIN: [0-9]{6}' | tail -1 | awk '{print $3}')"
+    [[ -n "$pin" ]] || fail_with_logs "server did not log a setup PIN"
+    post_json 204 "POST /api/v1/setup/session" "{\"pin\": \"${pin}\"}" "${SERVER_URL}/api/v1/setup/session"
+}
+
+step_register_services() {
+    local name rel count paths
+    for name in "${!TEST_SERVICES[@]}"; do
+        paths=()
+        for rel in ${TEST_SERVICES[$name]}; do
+            paths+=("$FAKE_SERVICES_DIR/$rel")
+        done
+        post_json 201 "POST /api/v1/services for ${name}" \
+            "$(jq -n --arg name "$name" '{name: $name, paths: $ARGS.positional}' --args "${paths[@]}")" \
+            "${SERVER_URL}/api/v1/services"
+    done
+    count="$(curl -fsS --max-time 5 -b "$SETUP_COOKIES" "${SERVER_URL}/api/v1/services" | jq 'length')"
+    [[ "$count" == "${#TEST_SERVICES[@]}" ]] \
+        || fail_with_logs "expected ${#TEST_SERVICES[@]} registered services, server lists ${count}"
+}
+
+step_complete_setup() {
+    post_json 204 "POST /api/v1/setup/complete" "{}" "${SERVER_URL}/api/v1/setup/complete"
+    expect_status 404 "/config after setup completed" "${SERVER_URL}/config"
+    expect_status 200 "config API after setup completed" "${SERVER_URL}/api/v1/services"
+}
+
 step_client_resolves_server() {
     local active_server=""
     resolved() {
@@ -288,20 +360,40 @@ step_verify_archive() {
     echo "$listing" > "$LAST_RUN_FILE"
 
     for entry in "${EXPECTED_ARCHIVE_ENTRIES[@]}"; do
-        grep -q -- "$entry" <<<"$listing" || missing+=("$entry")
+        grep -qF -- "$entry" <<<"$listing" || missing+=("$entry")
     done
     (( ${#missing[@]} == 0 )) \
         || fail_with_logs "archive is missing expected entries: ${missing[*]} (see ${LAST_RUN_FILE})"
+    ! grep -qE '/qbittorrent-saved-torrents/$' <<<"$listing" \
+        || fail_with_logs "single-file path was archived as a directory (see ${LAST_RUN_FILE})"
+}
+
+step_verify_restore() {
+    local archive="$WORKDIR/downloaded-backup.zip" restore="$WORKDIR/restore" name rel
+    mkdir -p "$restore"
+    unzip -q "$archive" -d "$restore" || fail_with_logs "could not extract the downloaded archive"
+    [[ -L "$restore$FAKE_SERVICES_DIR/sonarr/config/current-config.xml" ]] \
+        || fail_with_logs "symbolic link was not restored as a link"
+    for name in "${!TEST_SERVICES[@]}"; do
+        for rel in ${TEST_SERVICES[$name]}; do
+            diff -r --no-dereference "$FAKE_SERVICES_DIR/$rel" "$restore$FAKE_SERVICES_DIR/$rel" >&2 \
+                || fail_with_logs "restored ${rel} differs from the original"
+        done
+    done
 }
 
 run_workflow() {
     local start steps=(
         "step_server_healthy:confirming server health payload"
+        "step_unlock_setup:unlocking server setup with the logged PIN"
+        "step_register_services:registering fake services through the server API"
+        "step_complete_setup:finishing setup and confirming the setup page is disabled"
         "step_client_resolves_server:waiting for client to resolve the test server"
         "step_trigger_backup:triggering a backup run through the client"
         "step_backup_listed:verifying the server lists the new backup"
         "step_pickup_latest:fetching the latest backup via client pickup"
         "step_verify_archive:validating the downloaded archive contents"
+        "step_verify_restore:restoring the archive and comparing it with the originals"
     )
     local i=0 step
     start=$(date +%s)
@@ -320,12 +412,14 @@ main() {
     detect_docker_access
 
     WORKDIR="$(mktemp -d)"
+    SETUP_COOKIES="$WORKDIR/setup-cookies.txt"
     trap on_exit EXIT INT TERM
 
     stage_sources
 
     # Clear out anything left behind by a previously interrupted run.
     compose down -v --remove-orphans >/dev/null 2>&1 || true
+    remove_helper_containers
 
     run_unit_tests
     start_stack
