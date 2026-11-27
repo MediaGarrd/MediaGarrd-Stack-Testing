@@ -1,7 +1,9 @@
 # Fully isolated MediaGarrd smoke-test environment.
 #
 # - Builds the *real* MediaGarrd-Server and MediaGarrd-Client images straight
-#   from the ../MediaGarrd source tree (the actual repo is never modified).
+#   from the Server and Client source trees (run-test.sh points
+#   MEDIAGARRD_SERVER_DIR and MEDIAGARRD_CLIENT_DIR at clones or a local
+#   checkout; the sources are never modified).
 # - The server gets the host Docker socket; run-test.sh registers services
 #   pointing at the small fake config/db files under ./fake-services/ (host
 #   paths), which the server copies out through busybox helper containers.
@@ -24,7 +26,7 @@ services:
     container_name: mediagarrd-server-test
     environment:
       - SERVER_PORT=8080
-      - MEDIAGARRD_BACKUP_INTERVAL=PT1H # scheduler disabled for the test window; runs are triggered manually
+      - MEDIAGARRD_BACKUP_INTERVAL=PT1H # the scheduler runs one backup as soon as setup completes, then waits an hour; the test also triggers a run itself
       - MEDIAGARRD_BACKUP_ROOT=/data/server/backups
       - MEDIAGARRD_RETENTION_COUNT=10
       - MEDIAGARRD_DATABASE_PATH=/var/lib/mediagarrd/db/mediagarrd.db
@@ -48,18 +50,38 @@ services:
       - mediagarrd-server-test
     environment:
       - CLIENT_PORT=8081
-      # Long pickup interval so the client's own 60s auto-pickup scheduler
-      # never fires mid-test; the test drives pickup manually via the API.
+      # The scheduler picks up the newest backup within a minute of pairing
+      # whatever the interval; the test drives its own pickup through the API
+      # and the scheduler skips a backup that is already downloaded.
       - CLIENT_PICKUP_INTERVAL=PT1H
       - CLIENT_DOWNLOAD_DIRECTORY=/var/lib/mediagarrd/downloads
       - CLIENT_STATE_FILE=/var/lib/mediagarrd/client/state.json
       - MEDIAGARRD_SERVER_PORT=8080
       - MEDIAGARRD_SERVER_IP=mediagarrd-server-test
+      - CLIENT_PASSWORD=${MGTEST_CLIENT_PASSWORD:-}
     volumes:
       - "client-downloads-test:/var/lib/mediagarrd/downloads"
       - "client-state-test:/var/lib/mediagarrd/client"
     ports:
       - "18081:8081"
+    networks:
+      - mediagarrd-test-net
+    restart: "no"
+
+  mediagarrd-client-fc-test:
+    profiles: ["firstcome"]
+    image: mediagarrd-client:test
+    container_name: mediagarrd-client-fc-test
+    environment:
+      - CLIENT_PORT=8082
+      - CLIENT_PICKUP_INTERVAL=PT1H
+      - CLIENT_STATE_FILE=/var/lib/mediagarrd/client/state.json
+      - MEDIAGARRD_SERVER_PORT=8080
+      - MEDIAGARRD_SERVER_IP=mediagarrd-server-test
+    volumes:
+      - "client-fc-state-test:/var/lib/mediagarrd/client"
+    ports:
+      - "18082:8082"
     networks:
       - mediagarrd-test-net
     restart: "no"
@@ -77,3 +99,5 @@ volumes:
     name: mediagarrd-test-client-downloads
   client-state-test:
     name: mediagarrd-test-client-state
+  client-fc-state-test:
+    name: mediagarrd-test-client-fc-state
